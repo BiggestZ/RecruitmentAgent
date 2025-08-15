@@ -1,0 +1,16 @@
+langgraph==0.5.4
+langchain_core==0.3.72
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.116.0
+openai==1.86.0
+pypdf==5.8.0
+python-docx==1.2.0
+requests==2.32.4
+pydantic==2.11.7
+python-dotenv==1.1.1
+fastmcp==2.10.6 
+tavily-python==0.7.10
+fastui==0.7.0
+watchdog==6.0.0
+fastapi==0.116.1
