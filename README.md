@@ -8,15 +8,22 @@ This project is still in early stages with work to be done. The current implemen
 
 ## Features
 
-- **Resume Processing**: Extracts text from PDF files and identifies applicant information
+- **Resume Processing**: Extracts text from PDF files using PyMuPDF and identifies applicant information
 - **Applicant Information Extraction**: Automatically extracts names and email addresses from resumes
 - **Experience Extraction**: Identifies and extracts work experience sections
+- **Recruiter Info Extraction**: Extracts recruiter email and name from job descriptions
 - **Job Matching**: Compares candidate experience with job requirements using OpenAI GPT-4
+- **Flexible Match Criteria**: Accepts matches when requirements are met or score ≥ 8/10
 - **Google Drive Integration**: Reads job opportunities from Google Drive folders using OAuth2
-- **Email Automation**: Sends personalized notifications to recruiters via Gmail
-- **Calendar Integration**: Checks recruiter availability using Cal.com API
+- **Email Automation (Recruiters)**: Sends personalized notifications to recruiters via Gmail
+- **Email Automation (Applicants)**: Notifies applicants about matched roles and proposes time slots
+- **Calendar Integration**: Checks recruiter availability using Google Calendar Free/Busy API
 - **MCP Integration**: Uses Gentoro MCP server for external services
 - **Batch Processing**: Processes multiple resumes from a folder automatically
+
+**IMPORTANT NOTICE**
+For all recruiters, please ensure their "primary" google calendar is the one holding all their schedules, as the program is designed to use an accounts primary calendar, otherwise it will pull from the wrong calendar. 
+- The primary calendar is the first calendar that comes when making a google account.
 
 ## Prerequisites
 
@@ -24,7 +31,7 @@ This project is still in early stages with work to be done. The current implemen
 - Google Cloud Project with Drive API enabled
 - OpenAI API key
 - Gentoro MCP server access
-- Cal.com account (for calendar functionality)
+- Google Calendar API access (enabled in your Google Cloud project)
 
 ## Installation
 
@@ -101,22 +108,23 @@ mkdir resume_processed     # Processed resumes are moved here
 
 The agent uses Gentoro's MCP server for:
 - **Gmail**: Email sending functionality
-- **Tavily Search**: Web search capabilities (optional) # The goal was to use Tavily to scrape LinkedIN, LinkedIN does not like to be scraped :(
-- **Cal.com**: Calendar availability checking (Still in testing)
-- Feel Free to add any other MCP tools as needed.,m
+- **Tavily Search**: Web search capabilities (optional) {Initially used to scrape LinkedIN, but LinkedIN does not like being scraped via Tavily}
+- Feel free to add any other MCP tools as needed.
 
 The MCP server URL is configured in the code and should be provided by Gentoro.
 
-## Project Structure
+<!--  -->## Project Structure
 
 ```
 recruitment-assistant-agent/
+├── app/
+│   └── app.py                    # App entrypoint (located in app/) This will place into local folder for now. Adding GDrive soon.
 ├── recruit_agent.py              # Main agent implementation
 ├── requirements.txt              # Python dependencies
 ├── README.md                     # This file
 ├── .env                          # Environment variables (create this)
 ├── google_project_json/          # Google credentials directory
-│   └── client_secret_*.json     # Google OAuth2 credentials
+│   └── client_secret_*.json      # Google OAuth2 credentials
 ├── resume_unscanned/             # Place new resumes here
 └── resume_processed/             # Processed resumes moved here
 ```
@@ -127,7 +135,7 @@ recruitment-assistant-agent/
 
 1. **Prepare resumes**: Place PDF resume files in the `resume_unscanned` folder
 2. **Set up job opportunities**: Upload job descriptions to your Google Drive folder
-3. **Update the folder ID**: Modify the `folder_id` in `recruit_agent.py` (line ~750)
+3. **Update the folder ID**: Modify the `folder_id` in `recruit_agent.py` (In main.py)
 4. **Run the agent**:
 
 ```bash
@@ -137,21 +145,25 @@ python recruit_agent.py
 The agent will:
 - Process all PDF files in `resume_unscanned`
 - Extract applicant information (name, email)
-- Match resumes against job opportunities
-- Send personalized emails to recruiters
+- Read and parse job descriptions from Google Drive (extract recruiter email and name)
+- Match resumes against job requirements using GPT-4
+- Accept matches when requirements are met or score ≥ 8/10
+- Check recruiter availability via Google Calendar (morning/afternoon slots)
+- Email recruiters with matched candidate details
+- Email applicants with recruiter contact and proposed time slots
 - Move processed files to `resume_processed`
-
-
 
 ## How It Works
 
-1. **Resume Processing**: Extracts text and applicant information from PDF files
+1. **Resume Processing**: Extracts text and applicant information from PDF files using PyMuPDF
 2. **Experience Extraction**: Identifies and extracts the work experience section
 3. **Google Drive Reading**: Downloads and processes all job opportunities from Google Drive
-4. **Email Extraction**: Finds recruiter emails in job descriptions
+4. **Recruiter Info Extraction**: Finds recruiter emails and names in job descriptions
 5. **Matching**: Compares candidate experience with job requirements using OpenAI GPT-4
-6. **Calendar Check**: Checks recruiter availability for the next day
-7. **Email Sending**: Sends personalized notifications to recruiters with applicant details
+6. **Acceptance Criteria**: Accepts if requirements are met or score ≥ 8/10
+7. **Calendar Check**: Finds morning and afternoon availability via Google Calendar Free/Busy
+8. **Email Sending (Recruiters)**: Sends personalized notifications to recruiters with applicant details
+9. **Email Sending (Applicants)**: Notifies applicants with recruiter contact and proposed time slots
 
 ## API Keys and Security
 
@@ -184,7 +196,7 @@ The agent will:
 #### 1. "Session terminated" Errors
 - **Cause**: Usually indicates a misspelled tool name in MCP calls
 - **Solution**: Check tool names in the code, especially in `recruit_agent.py`
-- **Example**: `googlemail_send_email` vs `googlemail_send_email` (typo)
+- **Example**: `googlemail_send_email` vs `googleemail_send_email` (typo)
 
 #### 2. "Key null" Errors
 - **Cause**: API not authenticated on Gentoro's server side
@@ -228,10 +240,10 @@ Key dependencies from `requirements.txt`:
 ### Google Services
 - `google-auth-oauthlib==1.2.0`: OAuth2 authentication
 - `google-auth-httplib2==0.2.0`: HTTP client for Google APIs
-- `google-api-python-client==2.116.0`: Google Drive API
+- `google-api-python-client==2.116.0`: Google Drive and Calendar APIs
 
 ### File Processing
-- `pypdf==5.8.0`: PDF text extraction
+- `pymupdf==1.26.4`: PDF text extraction (PyMuPDF)
 - `python-docx==1.2.0`: DOCX text extraction
 
 ### MCP and External Services
@@ -257,7 +269,7 @@ Key dependencies from `requirements.txt`:
 3. **Tool Name Dependencies**: MCP tool names may change and require updates
 4. **Authentication**: OAuth2 flow may need manual intervention on first run
 5. **File Formats**: Currently only supports PDF files for resumes
-6. **Calendar Integration**: Cal.com integration is experimental
+6. **Calendar Integration**: Google Calendar integration is in progress
 
 ## Contributing
 

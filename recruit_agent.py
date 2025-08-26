@@ -15,25 +15,31 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
 from email.mime.text import MIMEText
-from pypdf import PdfReader
+import fitz  # PyMuPDF
 import io
-import os
+import os, sys
 import re
-import base64
+import datetime
+from datetime import timedelta, time, datetime
+import requests
+import textwrap
  
 # load environment variables
 from dotenv import load_dotenv
 
 load_dotenv()
 print("Environment variables loaded")
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly', "https://www.googleapis.com/auth/calendar"]
 credentials_path = os.path.join(os.getcwd(), 'google_project_json', 'credentials.json')
+
+# Set up the Service Account (please make sure to add you service account to any google files / calendars you will use)
 creds = service_account.Credentials.from_service_account_file(
     credentials_path,
     scopes=SCOPES
 )
+service = build("calendar", "v3", credentials=creds) # connect to gcal (to create events)
 
-# Define MCP client
+# Define and connect to MCP client
 url= os.getenv('gentoro_mcp_url')
 headers = {"Accept": "application/json, text/event-stream"}
 transport = StreamableHttpTransport(url=url, headers=headers)
@@ -41,9 +47,8 @@ client = Client(transport)
 
 # Initialize openai api key from env
 llm = ChatOpenAI(model="gpt-4", temperature=0)
-
- 
 print("MCP Client initialized with transport")
+
 
 class AgentState(TypedDict):
     # Resume fields
@@ -78,14 +83,24 @@ async def LinkedIn_search(topic):
 
 # Gets text from a PDF file
 def parse_pdf_node(state: AgentState) -> AgentState:
-    """Extracts text from a PDF file."""
+    """Extracts text from a PDF file using PyMuPDF for better text extraction."""
     try:
         r_fp = state["r_file_path"]
-        reader = PdfReader(r_fp)
+        
+        # Open the PDF with PyMuPDF
+        doc = fitz.open(r_fp)
         text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
-        print(f"Extracted text from {r_fp}")
+        
+        # Extract text from all pages
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            page_text = page.get_text()
+            text += page_text + "\n"
+        
+        # Close the document
+        doc.close()
+        
+        print(f"Extracted text from {r_fp} using PyMuPDF")
 
         if len(text) < 100:
             print(f"⚠️ Text is too short: {len(text)} characters")
@@ -101,6 +116,8 @@ def parse_pdf_node(state: AgentState) -> AgentState:
         }
     except Exception as e:
         print(f"Error extracting text from PDF: {e}")
+        os.remove(r_fp) # delete the unusable resume
+        sys.exit(0)
         return {"raw_text": "", "applicant_name": None, "applicant_email": ""}
 
 # Extracts the experience section from the resume text
@@ -132,6 +149,7 @@ def extract_experience_node(state: AgentState) -> AgentState:
     experience_lines = lines[start_index:end_index]
     return {'experience_text':"\n".join(experience_lines)} 
 
+# Cleans up text to make information extraction easier.
 def clean_job_text(text: str) -> str:
     lines = text.splitlines()
     cleaned_lines = []
@@ -145,6 +163,7 @@ def clean_job_text(text: str) -> str:
 
     return '\n'.join(cleaned_lines)
 
+# Gets Applicant's Name and Email from the document, stores for later use.
 def extract_applicant_info(text):
     """Extract applicant name and email from resume text"""
     applicant_name = None
@@ -210,6 +229,7 @@ def extract_applicant_info(text):
     
     return applicant_name, applicant_email
 
+# Extracts a recruiters email and filename.
 def extract_recruiter_emails_node(state: AgentState) -> AgentState:
     recruiter_list = state.get("recruiter_list", [])
     drive_entries = state.get("drive_texts", [])
@@ -223,8 +243,40 @@ def extract_recruiter_emails_node(state: AgentState) -> AgentState:
 
         if email_matches:
             email = email_matches[0]  # Only get the first one
+            
+            # Extract recruiter name
+            recruiter_name = None
+            
+            # Strategy 1: Look for common name patterns near the email
+            name_patterns = [
+                r'from\s*:\s*([A-Za-z\s\.]+)',
+                r'sent\s+by\s*:\s*([A-Za-z\s\.]+)',
+                r'contact\s*:\s*([A-Za-z\s\.]+)',
+                r'recruiter\s*:\s*([A-Za-z\s\.]+)',
+                r'hiring\s+manager\s*:\s*([A-Za-z\s\.]+)',
+                r'contact\s+name\s*:\s*([A-Za-z\s\.]+)'
+            ]
+            
+            for pattern in name_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    recruiter_name = match.group(1).strip()
+                    print(f"👤 Found recruiter name (pattern): {recruiter_name}")
+                    break
+            
+            # Strategy 2: Extract name from email if no pattern found
+            if not recruiter_name:
+                email_name = email.split('@')[0]
+                # Clean email name (remove numbers, dots, underscores)
+                clean_name = re.sub(r'[0-9._-]', ' ', email_name)
+                clean_name = ' '.join(clean_name.split())
+                if len(clean_name) > 2 and len(clean_name.split()) <= 3:
+                    recruiter_name = clean_name.title()
+                    print(f"👤 Found recruiter name (from email): {recruiter_name}")
+            
             recruiter_list.append({
                 "email": email,
+                "name": recruiter_name,
                 "job_file": filename
             })
             print(f"📧 Found recruiter email: {email} in {filename}")
@@ -261,10 +313,14 @@ def read_drive_folder_node(state: AgentState) -> AgentState:
             fh.seek(0) # Reset the file handle to the beginning
 
             if mime_type == 'application/pdf':
-                reader = PdfReader(fh)
+                # Use PyMuPDF for better text extraction
+                doc = fitz.open(stream=fh, filetype="pdf")
                 text = ""
-                for page in reader.pages:
-                    text += page.extract_text() or ""
+                for page_num in range(len(doc)):
+                    page = doc.load_page(page_num)
+                    page_text = page.get_text()
+                    text += page_text + "\n"
+                doc.close()
                 print(f"✅ Extracted PDF: {file_name}")
             elif mime_type.startswith("text/"): # 
                 text = fh.read().decode("utf-8")
@@ -342,12 +398,20 @@ def match_resume_node(state: AgentState) -> AgentState:
     """Compares the resume experience with the job requirements using an LLM."""
     resume = state.get("experience_text")
     drive_texts = state.get("drive_texts")
+    recruiter_list = state.get("recruiter_list")
 
     match_results = []
 
     for entry in drive_texts: 
         requirements = entry.get("requirements", "")
         filename = entry.get("filename", "Unknown")
+
+        recruiter_email = None
+        for recruiter in recruiter_list:
+            if recruiter.get("job_file") == filename:
+                recruiter_email = recruiter.get("email")
+                name = recruiter.get("name")
+
 
         if not requirements.strip():
             print(f"⚠️ No requirements found in {filename}, skipping.")
@@ -375,17 +439,33 @@ def match_resume_node(state: AgentState) -> AgentState:
             response = llm.invoke([HumanMessage(content=prompt)])
             content = response.content.strip()
 
-            if "Did Meet All Requirements: Yes" in content:
+            # Check if requirements are met OR score is 8 or above
+            requirements_met = "Did Meet All Requirements: Yes" in content
+            
+            # Extract score from the response
+            score_match = re.search(r'Score:\s*(\d+)/10', content)
+            score = None
+            if score_match:
+                score = int(score_match.group(1))
+            
+            # Accept if requirements are met OR score is 8 or above
+            if requirements_met or (score is not None and score >= 8):
                 match_results.append({
+                    "recruiter_email": recruiter_email,
+                    "name": name,
                     "filename": filename,
                     "match_score": content
                 })
+                print(f"✅ Match accepted for {filename} - Requirements met: {requirements_met}, Score: {score}")
+            else:
+                print(f"❌ Match rejected for {filename} - Requirements met: {requirements_met}, Score: {score}")
+            
             print(f"✅ Match result for {filename}:\n{content}\n")
         except Exception as e:
             print(f"❌ Error matching {filename}: {e}")
     return {"match_results": match_results}
 
-# Sends emails to recruiters with matched resumes
+# Sends emails to recruiters with matched resumes { Note: Need to remove recruiter list, rec. email is now min matched results}
 async def send_recruiter_emails_node(state: AgentState) -> AgentState:
     async with client:
         print("Preparing to send emails to recruiters...")
@@ -408,7 +488,7 @@ async def send_recruiter_emails_node(state: AgentState) -> AgentState:
             filename = recruiter.get("job_file")
             filename = filename.strip()  # Ensure no leading/trailing spaces
             email = recruiter.get("email")
-            job_title = recruiter.get("job_title", "your job opportunity")
+            job_title = recruiter.get("job_title", " your job opportunity ")
             print("Filename: ", filename)
             print(f"Checking recruiter {email} for job {job_title}...")
             
@@ -425,7 +505,14 @@ async def send_recruiter_emails_node(state: AgentState) -> AgentState:
                 else:
                     candidate_info = "a candidate"
                 
-                body = f"""\
+                # Get LLM notes for this specific match
+                llm_notes = ""
+                for match in match_results:
+                    if match["filename"] == filename:
+                        llm_notes = match.get("match_score", "")
+                        break
+                
+                body = textwrap.dedent(f"""\
     Hi {email.split('@')[0].capitalize()},
 
     I'm reaching out on behalf of our recruiting team. We've reviewed your job listing for **{job_title}** and found {candidate_info} whose resume matches the key requirements closely.
@@ -435,7 +522,10 @@ async def send_recruiter_emails_node(state: AgentState) -> AgentState:
     Best regards,  
     Recruitment Assistant Agent  
     Gentoro AI
-    """
+
+    ---
+    LLM Notes: {llm_notes}
+    """)
 
                 try:
                     # with open(resume_path, "rb") as f:
@@ -467,232 +557,285 @@ async def send_recruiter_emails_node(state: AgentState) -> AgentState:
 
         return state
 
-# After a matched recruiter is found, check their calendar for availability
-async def check_calendar_node(state: AgentState) -> AgentState:
-    """Check calendar availability for recruiters using Cal.com API through MCP"""
-    print("📅 Checking calendar availability for recruiters...")
-    
-    from datetime import datetime, timedelta
-    
-    # Get matched recruiters
-    match_results = state.get("match_results", [])
-    recruiter_list = state.get("recruiter_list", [])
-    
-    if not match_results:
-        print("⚠️ No matched recruiters found for calendar check")
-        return state
-    
-    # Find recruiters with matches
-    matched_recruiters = []
-    for recruiter in recruiter_list:
-        filename = recruiter.get("job_file", "").strip()
-        if any(match["filename"] == filename for match in match_results):
-            matched_recruiters.append(recruiter)
-    
-    if not matched_recruiters:
-        print("⚠️ No matched recruiters found for calendar check")
-        return state
-    
-    print(f"🔍 Found {len(matched_recruiters)} matched recruiters to check calendar for")
-    
-    # Check calendar for zjchouhry (assuming all recruiters use the same calendar)
-    username = "zjchoudhry"
-    tomorrow = datetime.now() + timedelta(days=1)
-    tomorrow_str = tomorrow.strftime('%Y-%m-%d')
-    
-    print(f"📅 Checking availability for {username} on {tomorrow_str}")
-    
-    try:
-        async with client:
-            # Try different possible Cal.com tool names
-            possible_tool_names = [
-                'weekly_calendar_free_times'
+# Helper Function to find all Free slots for a given time window (Set to 9am to 5pm PST)
+def _collect_slots_in_window(busy_intervals, window_start, window_end, max_to_collect):
+    """Collect up to max_to_collect 30-minute slots within [window_start, window_end)."""
+    slots = []
+    cursor = window_start
+    for start, end in busy_intervals:
+        # Ignore busy blocks fully before our cursor, ignores all past events
+        if end <= cursor:
+            continue
+        # Fill any free gap before the next busy start { If a busy block is found after cursor -> there is some free time }
+        if start > cursor:
+            free_until = min(start, window_end)
+            while max_to_collect > 0 and cursor + timedelta(minutes=30) <= free_until:
+                slots.append({
+                    "start": cursor.isoformat(),
+                    "end": (cursor + timedelta(minutes=30)).isoformat()
+                })
+                cursor += timedelta(minutes=30) # iterate in 30 min intervals to find all 30min slots
+                max_to_collect -= 1
+                if max_to_collect == 0:
+                    return slots
+        # Advance cursor to after this busy block
+        cursor = max(cursor, end)
+        if cursor >= window_end:
+            return slots
+    # After last busy block, try to fill until window end
+    while max_to_collect > 0 and cursor + timedelta(minutes=30) <= window_end:
+        slots.append({
+            "start": cursor.isoformat(),
+            "end": (cursor + timedelta(minutes=30)).isoformat()
+        })
+        cursor += timedelta(minutes=30)
+        max_to_collect -= 1
+    return slots
+
+# Find a recruiters free times so they can be sent to the applicant for an interview
+def find_free_time_(service, email, weeks_to_check=2, morning_needed=2, afternoon_needed=2):
+    """
+    Find two morning (9:00–12:00) and two afternoon (13:00–17:00) 30-min free slots.
+    Starts searching from the day after today (or next Monday if today is Friday).
+    Returns dict with lists of slots under keys "morning" and "afternoon".
+    """
+    # Want the variable for the day after
+    today = datetime.now()
+    tomorrow = today + timedelta(days=3) 
+
+    # If Friday, start next Monday; otherwise, start tomorrow
+    if today.weekday() == 4:
+        search_start = today + timedelta(days=3)
+    else:
+        search_start = tomorrow
+    # Monday of the start week
+    monday = search_start - timedelta(days=search_start.weekday())
+
+    print(f"🔍 Checking availability for: {email}")
+    print(f"📅 Today is: {today.strftime('%A, %Y-%m-%d')}")
+    print(f"📅 Starting search from: {search_start.strftime('%Y-%m-%d')}")
+    print(f"📅 Checking {weeks_to_check} weeks ahead")
+    print()
+
+    morning_slots = []
+    afternoon_slots = []
+
+    for week_offset in range(weeks_to_check):
+        week_start = monday + timedelta(days=week_offset * 7)
+        week_end = week_start + timedelta(days=5)  # Mon–Fri
+        print(f"📅 Week {week_offset + 1}: {week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}")
+
+        freebusy_query = {
+            "timeMin": week_start.isoformat() + "Z",
+            "timeMax": week_end.isoformat() + "Z",
+            "timeZone": "America/Los_Angeles",
+            "items": [{"id": email}],
+        }
+
+        try:
+            response = service.freebusy().query(body=freebusy_query).execute()
+            if email not in response.get("calendars", {}):
+                print(f"⚠️ No calendar access for {email}")
+                continue
+
+            busy_times = response["calendars"][email].get("busy", [])
+            # Normalize busy intervals to naive datetimes for comparison
+            busy_intervals = [
+                (datetime.fromisoformat(b["start"].replace("Z", "+00:00")).replace(tzinfo=None),
+                 datetime.fromisoformat(b["end"].replace("Z", "+00:00")).replace(tzinfo=None))
+                for b in busy_times
             ]
-            
-            availability_data = None
-            used_tool = None
-            
-            for tool_name in possible_tool_names:
-                try:
-                    print(f"🔍 Trying Cal.com tool: {tool_name}")
-                    
-                    # First, get calendar events for the day
-                    print(f"📅 Fetching calendar events for {tomorrow_str}...")
-                    
-                    # Try to get calendar events using a calendar tool
-                    calendar_events = []
-                    try:
-                        # Try different calendar event fetching tools
-                        calendar_tools = [
-                            'get_calendar_events',
-                            'calendar_get_events',
-                            'cal_events',
-                            'fetch_calendar_events'
-                        ]
-                        
-                        for cal_tool in calendar_tools:
-                            try:
-                                cal_result = await client.call_tool(cal_tool, {
-                                    'username': username,
-                                    'date': tomorrow_str,
-                                    'timezone': 'America/New_York'
-                                })
-                                
-                                if hasattr(cal_result, 'content') and cal_result.content:
-                                    for content in cal_result.content:
-                                        if hasattr(content, 'text'):
-                                            events_text = content.text
-                                            try:
-                                                import json
-                                                events_data = json.loads(events_text)
-                                                if isinstance(events_data, list):
-                                                    calendar_events = events_data
-                                                    print(f"✅ Retrieved {len(calendar_events)} calendar events using {cal_tool}")
-                                                    break
-                                            except json.JSONDecodeError:
-                                                print(f"⚠️ {cal_tool} returned non-JSON data")
-                                                continue
-                                
-                                if calendar_events:
-                                    break
-                                    
-                            except Exception as cal_error:
-                                print(f"⚠️ {cal_tool} failed: {cal_error}")
-                                continue
-                        
-                        if not calendar_events:
-                            print("⚠️ Could not fetch calendar events, using empty array")
-                            calendar_events = []
-                            
-                    except Exception as e:
-                        print(f"❌ Error fetching calendar events: {e}")
-                        calendar_events = []
-                    
-                    # Convert calendar events to JSON string
-                    calendar_events_json = json.dumps(calendar_events)
-                    
-                    # Call the weekly_calendar_free_times function through MCP
-                    result = await client.call_tool(tool_name, {
-                        'working_hours_start': '09:00',
-                        'working_hours_end': '17:00',
-                        'timezone': 'America/New_York',
-                        'calendar_events': calendar_events_json
-                    })
-                    
-                    # Check if we got a successful result
-                    if hasattr(result, 'content') and result.content:
-                        for content in result.content:
-                            if hasattr(content, 'text'):
-                                text = content.text
-                                if 'error' not in text.lower() and 'failure' not in text.lower():
-                                    availability_data = text
-                                    used_tool = tool_name
-                                    print(f"✅ Successfully retrieved calendar data using {tool_name}")
-                                    break
-                    
-                    if availability_data:
-                        break
-                        
-                except Exception as e:
-                    print(f"⚠️ Tool {tool_name} failed: {e}")
+            busy_intervals.sort(key=lambda x: x[0])
+            print(f"📊 Found {len(busy_intervals)} busy time blocks")
+
+            for day_offset in range(5):
+                if len(morning_slots) >= morning_needed and len(afternoon_slots) >= afternoon_needed:
+                    break
+                day = week_start + timedelta(days=day_offset)
+                # Skip days before search_start
+                if day.date() < search_start.date():
                     continue
+
+                # Morning window 09:00–12:00
+                if len(morning_slots) < morning_needed:
+                    m_start = datetime.combine(day.date(), time(9, 0))
+                    m_end = datetime.combine(day.date(), time(12, 0))
+                    m_found = _collect_slots_in_window(busy_intervals, m_start, m_end, morning_needed - len(morning_slots))
+                    for s in m_found:
+                        morning_slots.append({
+                            **s,
+                            "week": week_offset + 1,
+                            "day": day.strftime('%A'),
+                            "date": day.strftime('%Y-%m-%d'),
+                            "period": "morning"
+                        })
+                        print(f"✅ Morning slot: {day.strftime('%A %Y-%m-%d')} at {datetime.fromisoformat(s['start']).strftime('%I:%M %p')}")
+                        if len(morning_slots) >= morning_needed:
+                            break
+
+                # Afternoon window 13:00–17:00
+                if len(afternoon_slots) < afternoon_needed:
+                    a_start = datetime.combine(day.date(), time(13, 0))
+                    a_end = datetime.combine(day.date(), time(17, 0))
+                    a_found = _collect_slots_in_window(busy_intervals, a_start, a_end, afternoon_needed - len(afternoon_slots))
+                    for s in a_found:
+                        afternoon_slots.append({
+                            **s,
+                            "week": week_offset + 1,
+                            "day": day.strftime('%A'),
+                            "date": day.strftime('%Y-%m-%d'),
+                            "period": "afternoon"
+                        })
+                        print(f"✅ Afternoon slot: {day.strftime('%A %Y-%m-%d')} at {datetime.fromisoformat(s['start']).strftime('%I:%M %p')}")
+                        if len(afternoon_slots) >= afternoon_needed:
+                            break
+
+            if len(morning_slots) >= morning_needed and len(afternoon_slots) >= afternoon_needed:
+                break
+
+        except Exception as e:
+            print(f"❌ Error fetching freebusy for week {week_offset + 1}: {e}")
+            continue
+
+    return {"morning": morning_slots, "afternoon": afternoon_slots}
+
+# After getting recruiter times, send applicant email to know of:
+# 1. the match 2. potential meeting times 3. If reschedule, contact recruiter directly.
+
+async def send_applicant_emails_node(state: AgentState) -> AgentState:
+    ''' 
+    Send the applicant an email that congratulates them, tells them which job, the name & email of the recruiter, 
+    and shares 4 potential slots for an interview.
+    '''
+    async with client:
+        print("Preparing to send emails to applicants...")
+
+        # Get state variables
+        match_list = state.get("match_results", [])
+        applicant_name = state.get("applicant_name", "Candidate")
+        applicant_email = state.get("applicant_email", "")
+        
+        if not applicant_email:
+            print("⚠️ No applicant email found, cannot send notification")
+            return state
+        
+        if not match_list:
+            print("⚠️ No matches found, no email to send")
+            return state
+
+        emails_sent = 0
+
+        # For every matched job
+        for match in match_list:
+            recruiter_email = match.get("recruiter_email")
+            filename = match.get("filename", "").strip()
+            # job_title = match.get("job_title", "Position") # Future Additions
+            # company_name = match.get("company", "the company") # Future Additions
             
-            if not availability_data:
-                print("❌ Could not retrieve calendar availability from any Cal.com tool")
-                return state
+            if not recruiter_email:
+                print(f"⚠️ No recruiter email found for match: {filename}")
+                continue
             
-            # Parse the availability data (assuming it's JSON or structured text)
+            recruiter_name = recruiter_email.split('@')[0].replace('.', ' ').title()  # Extract name from email
+            
+            print(f"Processing match for recruiter {recruiter_email}")
+            
             try:
-                import json
-                if isinstance(availability_data, str):
-                    # Try to parse as JSON
-                    try:
-                        parsed_data = json.loads(availability_data)
-                    except json.JSONDecodeError:
-                        # If not JSON, treat as text and extract information
-                        parsed_data = {'raw_text': availability_data}
-                else:
-                    parsed_data = availability_data
+                # Use your existing helper function to get 4 free slots - 2 morning, 2 afternoon
+                slots = find_free_time_(service, recruiter_email, weeks_to_check=2, morning_needed=2, afternoon_needed=2)
+                morning_slots = slots.get("morning", [])
+                afternoon_slots = slots.get("afternoon", [])
                 
-                # Extract free time slots from the parsed data
-                free_slots = []
+                # Format available times
+                times_text = ""
+                all_slots = morning_slots + afternoon_slots
                 
-                # Try different ways to extract time slots based on the data structure
-                if 'slots' in parsed_data:
-                    # Direct slots format
-                    for slot in parsed_data['slots']:
-                        free_slots.append({
-                            'start': slot.get('start', ''),
-                            'end': slot.get('end', ''),
-                            'formatted_start': slot.get('formatted_start', slot.get('start', '')),
-                            'formatted_end': slot.get('formatted_end', slot.get('end', ''))
-                        })
-                elif 'free_slots' in parsed_data:
-                    # Free slots format
-                    free_slots = parsed_data['free_slots']
-                elif 'availability' in parsed_data:
-                    # Availability format
-                    availability = parsed_data['availability']
-                    if isinstance(availability, list):
-                        free_slots = availability
-                else:
-                    # Fallback: generate default slots based on business hours
-                    print("⚠️ Could not parse specific time slots, generating default business hours")
-                    business_start = 9  # 9 AM
-                    business_end = 17   # 5 PM
+                if all_slots:
+                    times_text = "Here are some available meeting times with the recruiter:\n\n"
                     
-                    slot_start = datetime.strptime(f"{tomorrow_str} {business_start:02d}:00:00", "%Y-%m-%d %H:%M:%S")
-                    slot_end = datetime.strptime(f"{tomorrow_str} {business_end:02d}:00:00", "%Y-%m-%d %H:%M:%S")
+                    if morning_slots:
+                        times_text += "**Morning Options (9 AM - 12 PM):**\n"
+                        for i, slot in enumerate(morning_slots, 1):
+                            start_time = datetime.fromisoformat(slot["start"])
+                            end_time = datetime.fromisoformat(slot["end"])
+                            times_text += f"   {i}. {slot['day']}, {slot['date']} - {start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}\n"
+                        times_text += "\n"
                     
-                    current_slot = slot_start
-                    while current_slot + timedelta(minutes=30) <= slot_end:
-                        slot_end_time = current_slot + timedelta(minutes=30)
-                        free_slots.append({
-                            'start': current_slot.isoformat(),
-                            'end': slot_end_time.isoformat(),
-                            'formatted_start': current_slot.strftime('%I:%M %p'),
-                            'formatted_end': slot_end_time.strftime('%I:%M %p')
-                        })
-                        current_slot += timedelta(minutes=30)
+                    if afternoon_slots:
+                        times_text += "**Afternoon Options (1 PM - 5 PM):**\n"
+                        for i, slot in enumerate(afternoon_slots, len(morning_slots) + 1):
+                            start_time = datetime.fromisoformat(slot["start"])
+                            end_time = datetime.fromisoformat(slot["end"])
+                            times_text += f"   {i}. {slot['day']}, {slot['date']} - {start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}\n"
+                        times_text += "\n"
+                    
+                    times_text += "Please reply to this email with your preferred time slot number, and we'll coordinate with the recruiter to confirm the meeting.\n"
+                else:
+                    times_text = "We're working on coordinating meeting times with the recruiter and will follow up with availability soon.\n"
                 
-                print(f"🕐 Found {len(free_slots)} free time slots for tomorrow")
+                # Get LLM match notes
+                llm_notes = match.get("match_score", "")
+                match_summary = ""
+                if llm_notes:
+                    # Clean up the LLM notes for better presentation
+                    match_summary = llm_notes.replace('Score:', 'Match Score:').replace('Did Meet All Requirements:', 'Requirements Met:').replace('Comment:', 'Feedback:')
                 
-                # Create booking link
-                booking_link = f"https://cal.com/{username}"
+                subject = f"Exciting News! You're a Match!"
+
+                # TO BE ADDED
+                # 🏢 **Company:** {company_name}
+                # 💼 **Position:** {job_title}
                 
-                # Add calendar information to state
-                calendar_info = {
-                    'username': username,
-                    'date': tomorrow_str,
-                    'free_slots': free_slots,
-                    'total_slots': len(free_slots),
-                    'booking_link': booking_link,
-                    'matched_recruiters': len(matched_recruiters),
-                    'tool_used': used_tool
-                }
+                body = textwrap.dedent(f"""\
+Hi {applicant_name},
+
+Congratulations! 🎉 Your resume has been matched with an exciting opportunity, and the recruiter is interested in connecting with you.
+
+**Job Details:**
+👤 **Recruiter:** {recruiter_name}
+📧 **Contact:** {recruiter_email}
+
+{times_text}
+
+**Next Steps:**
+1. Review the available meeting times above
+2. Reply to this email with your preferred time slot number
+3. We'll coordinate with {recruiter_name} to confirm the meeting
+4. Alternatively, you can reach out directly to {recruiter_email} if you need different times
+
+We're excited about this potential match and wish you the best of luck with your interview!
+
+Best regards,  
+Recruitment Assistant Agent  
+Gentoro AI
+
+---
+This is an automated message. Please reply with your preferred meeting time or contact the recruiter directly.
+""")
+
+                # Send the email
+                await client.call_tool('google_mail_send_email', {
+                    'sender_id': "me",
+                    'recipient_email': applicant_email,
+                    'subject': subject,
+                    'body': body
+                })
                 
-                # Update recruiter list with calendar info
-                for recruiter in matched_recruiters:
-                    recruiter['calendar_available'] = len(free_slots) > 0
-                    recruiter['available_slots'] = free_slots[:3]  # First 3 slots
-                    recruiter['booking_link'] = booking_link
-                
-                print(f"✅ Calendar check completed. {len(free_slots)} slots available for {len(matched_recruiters)} recruiters")
-                
-                return {
-                    'recruiter_list': recruiter_list,
-                    'calendar_info': calendar_info
-                }
+                # print(f"✅ Email sent to {applicant_email} for {job_title} position at {company_name}")
+                print(f" 📅 Included {len(all_slots)} available time slots")
+                emails_sent += 1
                 
             except Exception as e:
-                print(f"❌ Error parsing calendar data: {e}")
-                return state
-                
-    except Exception as e:
-        print(f"❌ Error checking calendar: {e}")
-        print(f"🔍 Error type: {type(e).__name__}")
-        return state
+                # print(f"❌ Failed to process match for {job_title}: {e}")
+                print(f"🔍 Error type: {type(e).__name__}")
+                continue
 
+        if emails_sent == 0:
+            print("⚠️ No applicant emails sent.")
+        else:
+            print(f"✅ Successfully sent {emails_sent} notification(s) to {applicant_email}")
+
+        return state
 
 # Build LangGraph
 builder = StateGraph(AgentState)
@@ -704,7 +847,7 @@ builder.add_node("read_drive_folder", read_drive_folder_node)
 builder.add_node("extract_recruiters_emails_node", extract_recruiter_emails_node)
 builder.add_node("match_resume_node", match_resume_node)
 builder.add_node("send_recruiter_emails_node", send_recruiter_emails_node)
-#builder.add_node("check_calendar", check_calendar_node)
+builder.add_node("send_app_email_node", send_applicant_emails_node)
 
 # Edges
 builder.add_edge(START, "parse_pdf")
@@ -713,7 +856,9 @@ builder.add_edge("extract_experience", "read_drive_folder")
 builder.add_edge("read_drive_folder", "extract_recruiters_emails_node")
 builder.add_edge("extract_recruiters_emails_node", "match_resume_node")
 builder.add_edge("match_resume_node", "send_recruiter_emails_node")
-builder.add_edge("send_recruiter_emails_node", END)
+builder.add_edge("send_recruiter_emails_node", "send_app_email_node")
+builder.add_edge("send_app_email_node", END)
+#builder.add_edge("send_recruiter_emails_node", END)
 
 # Compile the graph
 graph = builder.compile()
@@ -737,7 +882,7 @@ async def main():
         
         if not pdf_files:
             print(f"❌ No PDF files found in '{resume_folder}' folder")
-            return
+            sys.exit(0) # Kill the
         
         print(f"📁 Found {len(pdf_files)} PDF files in '{resume_folder}' folder")
         
