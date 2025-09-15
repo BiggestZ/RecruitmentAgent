@@ -3,7 +3,7 @@
 
 
 # Import necessary libraries
-import asyncio
+import asyncio, ssl
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
@@ -19,6 +19,7 @@ import fitz  # PyMuPDF
 import io
 import os, sys
 import re
+import base64
 import datetime
 from datetime import timedelta, time, datetime
 import requests
@@ -30,14 +31,19 @@ from dotenv import load_dotenv
 load_dotenv()
 print("Environment variables loaded")
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly', "https://www.googleapis.com/auth/calendar"]
-credentials_path = os.path.join(os.getcwd(), 'google_project_json', 'credentials.json')
+
+# Build a robust path to the credentials file relative to the script's location.
+# This ensures the script works regardless of the current working directory.
+script_dir = os.path.dirname(os.path.abspath(__file__))
+credentials_path = os.path.abspath(os.path.join(script_dir, '..', '..', 'google_oauth', 'credentials.json'))
 
 # Set up the Service Account (please make sure to add you service account to any google files / calendars you will use)
 creds = service_account.Credentials.from_service_account_file(
     credentials_path,
     scopes=SCOPES
 )
-service = build("calendar", "v3", credentials=creds) # connect to gcal (to create events)
+service = build("calendar", "v3", credentials=creds)  # connect to gcal (to create events)
+service_drive = build('drive', 'v3', credentials=creds) # connect to gdrive (to read files)
 
 # Define and connect to MCP client
 url= os.getenv('gentoro_mcp_url')
@@ -47,48 +53,54 @@ client = Client(transport)
 
 # Initialize openai api key from env
 llm = ChatOpenAI(model="gpt-4", temperature=0)
-print("MCP Client initialized with transport")
+print("MCP Client initialized with transport, and LLM initialized")
 
 
 class AgentState(TypedDict):
     # Resume fields
-    r_file_path: str  # Path to the resume file
+    # r_file_path: str  # Path to the resume file (Obsolete)
+    file_id: str # The GDrive ID for the given file (provided in webhook)
+    file_name: str # The name of the given resume (provided in webhook)
     raw_text: str # Raw text content of the resume
     experience_text: Optional[str] # Extracted experience section from the resume
     applicant_name: Optional[str] # Name of the applicant
     applicant_email: str # Email of the applicant
 
     # Google Drive fields
-    folder_id: str # The path to the Google Drive with the opportunities
+    input_folder_id: str # The ID of the Google Drive folder with the opportunities
+    resume_folder_id: str # Where resumes are
+    output_folder_id: str # Path where matched resumes will be placed
     drive_texts: List[dict[str,str]] # List of file names in the Google Drive folder
     recruiter_list: List[dict[str,str]] # List of recruiters to contact IF a match is found
 
     # Match results
     match_results: Optional[List[dict]] # List of match results with filenames and scores
     
-    # Calendar fields
-    calendar_info: Optional[dict] # Calendar availability information for recruiters
-    
-
-# function to search for the linkedin profile (WIP: Linkedin does not like being scraped via Tavily)
-async def LinkedIn_search(topic):
-    return await client.call_tool('tavily_search_information', 
-                    {
-                     'topic':topic,
-                     'search_depth': 'basic',
-                     'max_results': '3',
-                     'include_images': 'false',
-                    }
-)
-
-# Gets text from a PDF file
+# Gets text from a PDF file (Extracts from a google doc in a GDrive folder)
 def parse_pdf_node(state: AgentState) -> AgentState:
     """Extracts text from a PDF file using PyMuPDF for better text extraction."""
+    file_id = state['file_id']
+    file_name = state['file_name']
+    print(f"--- Starting Agent Run for file: {file_name} (ID: {file_id}) ---")
+
     try:
-        r_fp = state["r_file_path"]
+
+        # Create temporary download of the file in memory 
+        request = service_drive.files().get_media(fileId=file_id)
+        pdf_buffer = io.BytesIO() 
+        downloader = MediaIoBaseDownload(pdf_buffer, request)
         
+        # Check statues of download
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
+            print(f"Download progress: {int(status.progress() * 100)}%")
+        
+        # Reset pdf buffer
+        pdf_buffer.seek(0)
+
         # Open the PDF with PyMuPDF
-        doc = fitz.open(r_fp)
+        doc = fitz.open(stream=pdf_buffer.getvalue(), filetype='pdf')
         text = ""
         
         # Extract text from all pages
@@ -99,8 +111,9 @@ def parse_pdf_node(state: AgentState) -> AgentState:
         
         # Close the document
         doc.close()
+        pdf_buffer.close() 
         
-        print(f"Extracted text from {r_fp} using PyMuPDF")
+        print(f"Extracted text from {file_name} using PyMuPDF")
 
         if len(text) < 100:
             print(f"⚠️ Text is too short: {len(text)} characters")
@@ -116,8 +129,10 @@ def parse_pdf_node(state: AgentState) -> AgentState:
         }
     except Exception as e:
         print(f"Error extracting text from PDF: {e}")
-        os.remove(r_fp) # delete the unusable resume
-        sys.exit(0)
+        # os.remove(r_fp) # delete the unusable resume
+        # Add line to remove a broken or push for manual review 
+        raise RuntimeError("Failed to parse PDF due to SSL error")
+        #sys.exit(0)
         return {"raw_text": "", "applicant_name": None, "applicant_email": ""}
 
 # Extracts the experience section from the resume text
@@ -287,11 +302,10 @@ def extract_recruiter_emails_node(state: AgentState) -> AgentState:
 
 # Opens a google drive folder and reads all files in it, put files in a list
 def read_drive_folder_node(state: AgentState) -> AgentState:
-    folder_id = state["folder_id"]
-    service = build('drive', 'v3', credentials=creds)  # assumes credentials already handled
+    folder_id = state["resume_folder_id"]
 
     query = f"'{folder_id}' in parents and trashed = false"
-    response = service.files().list(q=query, fields="files(id, name, mimeType)").execute()
+    response = service_drive.files().list(q=query, fields="files(id, name, mimeType)").execute()
     files = response.get('files', [])
 
     all_texts = []
@@ -302,13 +316,21 @@ def read_drive_folder_node(state: AgentState) -> AgentState:
         mime_type = file['mimeType']
 
         try:
-            request = service.files().get_media(fileId=file_id) # Get the file content
+            request = service_drive.files().get_media(fileId=file_id) # Get the file content
             fh = io.BytesIO() 
             downloader = MediaIoBaseDownload(fh, request) 
 
             done = False
             while not done:
-                status, done = downloader.next_chunk() 
+                try:
+                    status, done = downloader.next_chunk() 
+                except ssl.SSLError as e:
+                    print(f"SSL error while downloading file: {e}")
+                    raise
+                except Exception as e:
+                    print(f"Unexpected error: {e}")
+                    raise
+
 
             fh.seek(0) # Reset the file handle to the beginning
 
@@ -436,7 +458,7 @@ def match_resume_node(state: AgentState) -> AgentState:
         Comment: <your explanation here>
         """
         try:
-            response = llm.invoke([HumanMessage(content=prompt)])
+            response = llm.invoke(prompt)
             content = response.content.strip()
 
             # Check if requirements are met OR score is 8 or above
@@ -467,99 +489,111 @@ def match_resume_node(state: AgentState) -> AgentState:
 
 # Sends emails to recruiters with matched resumes { Note: Need to remove recruiter list, rec. email is now min matched results}
 async def send_recruiter_emails_node(state: AgentState) -> AgentState:
+    """Downloads the resume and emails it as an attachment to recruiters for matched jobs."""
     async with client:
-        print("Preparing to send emails to recruiters...")
+        print("--- Sending Recruiter Emails ---")
 
-        recruiter_list = state.get("recruiter_list", [])
         match_results = state.get("match_results", [])
-        resume_path = state.get("r_file_path", "")
-        resume_filename = os.path.basename(resume_path)
+        if not match_results:
+            print("No matches found, skipping recruiter emails.")
+            return state
 
-        print("Matched Jobs: ", match_results)
-        print("Recruiter List: ", recruiter_list)
-
-        emails_sent = 0  # <-- tracking variable
-
-        # Get applicant information
+        # Get resume info from state
+        file_id = state.get("file_id")
+        resume_filename = state.get("file_name", "resume.pdf")
         applicant_name = state.get("applicant_name", "the candidate")
         applicant_email = state.get("applicant_email", "")
+
+        # Download resume content to attach it to emails
+        encoded_file = None
+        if file_id:
+            try:
+                print(f"⬇️  Downloading resume '{resume_filename}' to attach to emails...")
+                request = service_drive.files().get_media(fileId=file_id)
+                pdf_buffer = io.BytesIO()
+                downloader = MediaIoBaseDownload(pdf_buffer, request)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+                pdf_buffer.seek(0)
+                file_data = pdf_buffer.read()
+                encoded_file = base64.b64encode(file_data).decode('utf-8')
+                print("✅ Resume downloaded and encoded for attachment.")
+            except Exception as e:
+                print(f"⚠️ Could not download resume for attachment: {e}")
         
-        for recruiter in recruiter_list:
-            filename = recruiter.get("job_file")
-            filename = filename.strip()  # Ensure no leading/trailing spaces
-            email = recruiter.get("email")
-            job_title = recruiter.get("job_title", " your job opportunity ")
-            print("Filename: ", filename)
-            print(f"Checking recruiter {email} for job {job_title}...")
+        emails_sent = 0
+        # Iterate through matches to send emails
+        for match in match_results:
+            recruiter_email = match.get("recruiter_email")
+            recruiter_name = match.get("name", "Recruiter")
+            job_filename = match.get("filename", "your job opportunity")
+
+            if not recruiter_email:
+                print(f"⚠️ No recruiter email for match with {job_filename}, skipping.")
+                continue
+
+            subject = f"Potential Candidate Match for {job_filename}"
             
+            # Create email body
+            if applicant_name and applicant_name != "the candidate":
+                candidate_info = f"**{applicant_name}**"
+                if applicant_email:
+                    candidate_info += f" ({applicant_email})"
+            else:
+                candidate_info = "a candidate"
+            
+            llm_notes = match.get("match_score", "No specific notes from the LLM.")
+            
+            body = textwrap.dedent(f"""\
+    Hi {recruiter_name},
 
-            if any(match["filename"] == filename for match in match_results) and email:
-                subject = f"Candidate Resume Match for {job_title}"
-                print("Subject of the email: ", subject)
-                
-                # Create email body with applicant information
-                if applicant_name and applicant_name != "the candidate":
-                    candidate_info = f"**{applicant_name}**"
-                    if applicant_email:
-                        candidate_info += f" ({applicant_email})"
-                else:
-                    candidate_info = "a candidate"
-                
-                # Get LLM notes for this specific match
-                llm_notes = ""
-                for match in match_results:
-                    if match["filename"] == filename:
-                        llm_notes = match.get("match_score", "")
-                        break
-                
-                body = textwrap.dedent(f"""\
-    Hi {email.split('@')[0].capitalize()},
-
-    I'm reaching out on behalf of our recruiting team. We've reviewed your job listing for **{job_title}** and found {candidate_info} whose resume matches the key requirements closely.
+    I'm reaching out on behalf of our recruiting team. We've reviewed your job listing for **{job_filename}** and found {candidate_info} whose resume appears to be a strong match.
 
     I've attached the candidate's resume for your review. If you'd like to connect with them, please let us know.
 
     Best regards,  
     Recruitment Assistant Agent  
     Gentoro AI
-
+    
     ---
-    LLM Notes: {llm_notes}
+    LLM Match Analysis:
+    {llm_notes}
     """)
 
-                try:
-                    # with open(resume_path, "rb") as f:
-                    #     file_data = f.read()
-                    #     encoded_file = base64.b64encode(file_data).decode('utf-8')
+            # Prepare payload with attachment if available
+            email_payload = {
+                'sender_id': "me",
+                'recipient_email': recruiter_email,
+                'subject': subject,
+                'body': body,
+            }
+            if encoded_file:
+                email_payload['attachments'] = [
+                    {
+                        'filename': resume_filename,
+                        'file_bytes': encoded_file
+                    }
+                ]
+                print_attachment_msg = f"with attachment '{resume_filename}'"
+            else:
+                print_attachment_msg = "without attachment"
 
-                    await client.call_tool('google_mail_send_email', {
-                        'sender_id': "me",
-                        'recipient_email': email,
-                        'subject': subject,
-                        'body': body,
-                        # 'attachments': [
-                        #     {
-                        #         'filename': resume_filename,
-                        #         'file_bytes': encoded_file
-                        #     }
-                        # ]
-                    })
-                    print(f"✅ Email sent to {email} with attachment {resume_filename}")
-                    emails_sent += 1  # <-- update count
+            try:
+                await client.call_tool('google_mail_send_email', email_payload)
+                print(f"✅ Email sent to {recruiter_email} {print_attachment_msg}")
+                emails_sent += 1
+            except Exception as e:
+                print(f"❌ Failed to send email to {recruiter_email}: {e}")
 
-                except Exception as e:
-                    print(f"❌ Failed to send email to {email}: {e}")
-                    print(f"🔍 Error type: {type(e).__name__}")
-                    print(f"🔍 Full error details: {str(e)}")
-
-                if emails_sent == 0:
-                    print("⚠️ No matching recruiters found or no emails sent.")
+        if emails_sent == 0:
+            print("⚠️ No recruiter emails were sent for this resume.")
 
         return state
 
 # Helper Function to find all Free slots for a given time window (Set to 9am to 5pm PST)
 def _collect_slots_in_window(busy_intervals, window_start, window_end, max_to_collect):
-    """Collect up to max_to_collect 30-minute slots within [window_start, window_end)."""
+    """Collect up to max_to_collect 30-minute slots within [window_starts, window_end)."""
     slots = []
     cursor = window_start
     for start, end in busy_intervals:
@@ -858,79 +892,80 @@ builder.add_edge("extract_recruiters_emails_node", "match_resume_node")
 builder.add_edge("match_resume_node", "send_recruiter_emails_node")
 builder.add_edge("send_recruiter_emails_node", "send_app_email_node")
 builder.add_edge("send_app_email_node", END)
-#builder.add_edge("send_recruiter_emails_node", END)
 
-# Compile the graph
+
+# Compile the graph for the Langgraph API
 graph = builder.compile()
+print("Graph is compiled!") 
 
-# Run the graph
-async def main():
-    async with client:
-        # Define the resume folder to scan
-        resume_folder = 'resume_unscanned'
+# Run the graph locally (used for initial testing)
+# async def main():
+#     async with client:
+#         # Define the resume folder to scan
+#         resume_folder = 'resume_unscanned'
         
-        # Check if the folder exists
-        if not os.path.exists(resume_folder):
-            print(f"❌ Resume folder '{resume_folder}' not found")
-            return
+#         # Check if the folder exists
+#         if not os.path.exists(resume_folder):
+#             print(f"❌ Resume folder '{resume_folder}' not found")
+#             return
         
-        # Get all PDF files in the resume folder
-        pdf_files = []
-        for file in os.listdir(resume_folder):
-            if file.lower().endswith('.pdf'):
-                pdf_files.append(os.path.join(resume_folder, file))
+#         # Get all PDF files in the resume folder
+#         pdf_files = []
+#         for file in os.listdir(resume_folder):
+#             if file.lower().endswith('.pdf'):
+#                 pdf_files.append(os.path.join(resume_folder, file))
         
-        if not pdf_files:
-            print(f"❌ No PDF files found in '{resume_folder}' folder")
-            sys.exit(0) # Kill the
+#         if not pdf_files:
+#             print(f"❌ No PDF files found in '{resume_folder}' folder")
+#             sys.exit(0) # Kill the
         
-        print(f"📁 Found {len(pdf_files)} PDF files in '{resume_folder}' folder")
+#         print(f"📁 Found {len(pdf_files)} PDF files in '{resume_folder}' folder")
         
-        # Process each resume file one by one
-        for i, resume_path in enumerate(pdf_files, 1):
-            print(f"\n{'='*60}")
-            print(f"📄 Processing Resume {i}/{len(pdf_files)}: {os.path.basename(resume_path)}")
-            print(f"{'='*60}")
+#         # Process each resume file one by one
+#         for i, resume_path in enumerate(pdf_files, 1):
+#             print(f"\n{'='*60}")
+#             print(f"📄 Processing Resume {i}/{len(pdf_files)}: {os.path.basename(resume_path)}")
+#             print(f"{'='*60}")
             
-            try:
-                # Initialize state for this resume
-                state = {
-                    "folder_id": '1-In_XSM7YPLHWjjFNChYtaYCOb989lXT',
-                    "drive_texts": [],
-                    "r_file_path": resume_path,
-                    "raw_text": '',
-                    "experience_text": None,
-                    "applicant_name": None,  # Initialize applicant name as None
-                    "applicant_email": '',   # Initialize applicant email as empty string
-                    "recruiter_list": [],  # Initialize as empty list
-                    "calendar_info": None  # Initialize calendar info as None
-                }
+#             try:
+#                 # Initialize state for this resume
+#                 state = {
+#                     "folder_id": '1-In_XSM7YPLHWjjFNChYtaYCOb989lXT',
+#                     "drive_texts": [],
+#                     "r_file_path": resume_path,
+#                     "raw_text": '',
+#                     "experience_text": None,
+#                     "applicant_name": None,  # Initialize applicant name as None
+#                     "applicant_email": '',   # Initialize applicant email as empty string
+#                     "recruiter_list": [],  # Initialize as empty list
+#            
+#                 }
                 
-                # Process this resume
-                result = await graph.ainvoke(state)
+#                 # Process this resume
+#                 result = await graph.ainvoke(state)
                 
-                # Print summary for this resume
-                print(f"\n✅ Completed processing: {os.path.basename(resume_path)}")
+#                 # Print summary for this resume
+#                 print(f"\n✅ Completed processing: {os.path.basename(resume_path)}")
                 
-                # Move processed file to a different folder
-                try:
-                    processed_folder = 'resume_processed'
-                    if not os.path.exists(processed_folder):
-                        os.makedirs(processed_folder)
-                    new_path = os.path.join(processed_folder, os.path.basename(resume_path))
-                    os.rename(resume_path, new_path)
-                    print(f"📁 Moved to: {new_path}")
-                except Exception as move_error:
-                    print(f"⚠️ Could not move file: {move_error}")
+#                 # Move processed file to a different folder
+#                 try:
+#                     processed_folder = 'resume_processed'
+#                     if not os.path.exists(processed_folder):
+#                         os.makedirs(processed_folder)
+#                     new_path = os.path.join(processed_folder, os.path.basename(resume_path))
+#                     os.rename(resume_path, new_path)
+#                     print(f"📁 Moved to: {new_path}")
+#                 except Exception as move_error:
+#                     print(f"⚠️ Could not move file: {move_error}")
                 
-            except Exception as e:
-                print(f"❌ Error processing {os.path.basename(resume_path)}: {e}")
-                print(f"🔍 Error type: {type(e).__name__}")
-                continue
+#             except Exception as e:
+#                 print(f"❌ Error processing {os.path.basename(resume_path)}: {e}")
+#                 print(f"🔍 Error type: {type(e).__name__}")
+#                 continue
         
-        print(f"\n{'='*60}")
-        print(f"🏁 Completed processing {len(pdf_files)} resume files")
-        print(f"{'='*60}")
+#         print(f"\n{'='*60}")
+#         print(f"🏁 Completed processing {len(pdf_files)} resume files")
+#         print(f"{'='*60}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# if __name__ == "__main__":
+#     asyncio.run(main())

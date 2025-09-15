@@ -1,307 +1,214 @@
-# Recruitment Assistant Agent
+## Recruitment Assistant Agent
 
-An AI-powered recruitment agent that automatically processes resumes, matches them with job opportunities, and notifies recruiters when suitable candidates are found. This project is currently in early development stages with ongoing improvements and feature additions.
+An end-to-end workflow that watches a Google Drive folder for new resumes, triggers a LangGraph agent via HTTP, analyzes resumes against job requirements, and sends emails to recruiters and applicants.
 
-## ⚠️ Project Status: Early Development
+> Note: This project is under active development and has not yet been tested on LangGraph Cloud. Local development with `langgraph dev` is supported and documented below.
 
-This project is still in early stages with work to be done. The current implementation includes core functionality but may have bugs, incomplete features, and areas that need improvement. Use at your own risk and expect ongoing changes.
+### Features
+- Resume Processing: Extracts text from PDFs via PyMuPDF and identifies applicant info
+- Applicant Information Extraction: Parses names and email addresses from resumes
+- Experience Extraction: Captures the WORK EXPERIENCE section
+- Recruiter Info Extraction: Finds recruiter email/name from opportunity docs
+- Job Matching: Uses an LLM to compare resume experience vs. job requirements
+- Flexible Match Criteria: Accepts matches when requirements are met or score ≥ 8/10
+- Google Drive Integration: Reads opportunities from Drive via OAuth/Service Account
+- Email Automation (Recruiters): Sends tailored messages with optional resume attachment
+- Email Automation (Applicants): Notifies candidates and proposes time slots
+- Calendar Integration: Uses Google Calendar Free/Busy to suggest times
+- MCP Integration: Uses Gentoro MCP tools (e.g., Gmail)
+- Batch Processing: Processes multiple resumes automatically
 
-## Features
+### Prerequisites
+- Python 3.12
+- A Google Cloud project with OAuth client and a service account that has access to your Drive and Calendar assets
+- ngrok (or a public URL) for receiving Google Drive webhooks 
+- LangGraph CLI and runtime
 
-- **Resume Processing**: Extracts text from PDF files using PyMuPDF and identifies applicant information
-- **Applicant Information Extraction**: Automatically extracts names and email addresses from resumes
-- **Experience Extraction**: Identifies and extracts work experience sections
-- **Recruiter Info Extraction**: Extracts recruiter email and name from job descriptions
-- **Job Matching**: Compares candidate experience with job requirements using OpenAI GPT-4
-- **Flexible Match Criteria**: Accepts matches when requirements are met or score ≥ 8/10
-- **Google Drive Integration**: Reads job opportunities from Google Drive folders using OAuth2
-- **Email Automation (Recruiters)**: Sends personalized notifications to recruiters via Gmail
-- **Email Automation (Applicants)**: Notifies applicants about matched roles and proposes time slots
-- **Calendar Integration**: Checks recruiter availability using Google Calendar Free/Busy API
-- **MCP Integration**: Uses Gentoro MCP server for external services
-- **Batch Processing**: Processes multiple resumes from a folder automatically
-
-**IMPORTANT NOTICE**
-For all recruiters, please ensure their "primary" google calendar is the one holding all their schedules, as the program is designed to use an accounts primary calendar, otherwise it will pull from the wrong calendar. 
-- The primary calendar is the first calendar that comes when making a google account.
-
-## Prerequisites
-
-- Python 3.8+
-- Google Cloud Project with Drive API enabled
-- OpenAI API key
-- Gentoro MCP server access
-- Google Calendar API access (enabled in your Google Cloud project)
-
-## Installation
-
-### 1. Clone the Repository
-
+### Quick Start
+1) Clone and enter the project directory
 ```bash
-git clone <repository-url>
-cd recruitment-assistant-agent
+git clone <your-repo-url>
+cd "Recruitment Assistant Agent"
 ```
 
-### 2. Set Up Virtual Environment (Recommended)
-
+2) Create and activate a virtual environment
 ```bash
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-### 3. Install Dependencies
-
-```bash
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Configuration
-
-### 1. Environment Variables
-
-Create a `.env` file in the project root:
-
+3) Create a new LangGraph project (if you don’t already have one)
 ```bash
-# OpenAI API Key (Required)
-OPENAI_API_KEY=your_openai_api_key_here
-
-# Gentoro MCP Server Key (if required)
-gentoro_mcp_url=your_gentoro_key_here
+langgraph new
 ```
+- Follow the prompts. Ensure your assistant id in `langgraph.json` is `recruit-agent` (or update the Flask app to match).
 
-### 2. Google Drive Setup (OAuth2)
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project or select existing one
-3. Enable the Google Drive API
-4. Create OAuth2 credentials:
-   - Go to "APIs & Services" > "Credentials"
-   - Click "Create Credentials" > "OAuth 2.0 Client IDs"
-   - Download the JSON credentials file
-5. Place the credentials file in `google_project_json/client_secret_*.json`
-6. The first time you run the agent, it will prompt you to authenticate
-7. (Optional but recommended) Create a service account 
-   - Go to "IAM & Admin" > "Service Account"
-   - Click "Create Service Account" and provide ID, email, and description
-   - Assign role of editor at minimum when creating the account
-
-* NOTE: In this project, I use a Service Account with 'Editor' level authentication. 
-This allows me to access the google drive without needing to authenticate myself everytime.
-This is very useful if you are considering using one google drive to manage both processed and unprocessed resumes
-note that the service account only deals with the google drive, it does not handle the emails, calendar, or any other interactions.
-
-
-### 3. Folder Structure Setup
-
-Create the following folders in your project directory:
-
+4) Configure environment variables
+- If you have the provided `example.env`, copy it to the your langgraph server project directory and rename it to `.env` (same folder where this README is located):
 ```bash
-mkdir resume_unscanned    # Place new resumes here
-mkdir resume_processed     # Processed resumes are moved here
+cp example.env .env
+```
+- Or manually create a `.env` file at the project root:
+```env
+# Public webhook URL where Google will POST change notifications
+LANGGRAPH_WEBHOOK_URL=https://<your-ngrok-subdomain>.ngrok-free.app/webhooks/google-drive
+
+# Base URL of the LangGraph HTTP server (started with `langgraph dev`)
+# Example: http://127.0.0.1:8123 or your remote URL
+LANGGRAPH_API_URL=http://127.0.0.1:8123
+
+# Google Drive folder IDs
+# Folder watched for new/updated resumes
+INPUT_FOLDER_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Where processed resumes may be moved (optional for future use)
+OUTPUT_FOLDER_ID=yyyyyyyyyyyyyyyyyyyyyyyyyyyy
+# Folder containing job descriptions/opportunities the agent reads
+RESUME_FOLDER_ID=zzzzzzzzzzzzzzzzzzzzzzzzzz
 ```
 
-* Note: This is a temporary solution for local testing, in the future the folders will be in a Google Drive
-* Will add a measure so if a resume is matched to no opportunities it is deleted
-* Would like to add a feature so in a folder, a folder with a given recruiters name is made containing all their relevant resumes
+5) Add Google OAuth files
+- Place `client_secret.json` and `token.json` in `Langgraph_server/google_oauth/`.
+- Place your service account `credentials.json` in `Langgraph_server/google_oauth/`.
 
-### 4. Gentoro MCP Server
-
-The agent uses Gentoro's MCP server for:
-- **Gmail**: Email sending functionality
-- **Tavily Search**: Web search capabilities (optional) {Initially used to scrape LinkedIN, but LinkedIN does not like being scraped via Tavily}
-- Feel free to add any other MCP tools as needed.
-
-The MCP server URL is configured in the code and should be provided by Gentoro.
-
-<!--  -->## Project Structure
-
+Directory should contain:
 ```
-recruitment-assistant-agent/
-├── app/
-│   └── app.py                    # App entrypoint (located in app/) This will place into local folder for now. Adding GDrive soon.
-├── recruit_agent.py              # Main agent implementation
-├── requirements.txt              # Python dependencies
-├── README.md                     # This file
-├── .env                          # Environment variables (create this)
-├── google_project_json/          # Google credentials directory
-│   └── client_secret_*.json      # Google OAuth2 credentials
-├── resume_unscanned/             # Place new resumes here
-└── resume_processed/             # Processed resumes moved here
+Langgraph_server/google_oauth/
+  client_secret.json
+  token.json
+  credentials.json
 ```
 
-## Usage
+*** NOTICE:
+If using ngrok to tunnel flask - Run flask and ngrok first and change the `LANGGRAPH_WEBHOOK_URL` in your `.env` file. This way to webhooks will be sent to the api properly.
+*** 
 
-### Basic Usage
-
-1. **Prepare resumes**: Place PDF resume files in the `resume_unscanned` folder
-2. **Set up job opportunities**: Upload job descriptions to your Google Drive folder
-3. **Update the folder ID**: Modify the `folder_id` in `recruit_agent.py` (In main.py)
-4. **Run the agent**:
-
+### Start the LangGraph API
+From your LangGraph project directory [From 'Recruitment Assistant Agent' do: 'cd langgraph_server'] (where `langgraph.json` lives), run:
 ```bash
-python recruit_agent.py
+langgraph dev
 ```
 
-The agent will:
-- Process all PDF files in `resume_unscanned`
-- Extract applicant information (name, email)
-- Read and parse job descriptions from Google Drive (extract recruiter email and name)
-- Match resumes against job requirements using GPT-4
-- Accept matches when requirements are met or score ≥ 8/10
-- Check recruiter availability via Google Calendar (morning/afternoon slots)
-- Email recruiters with matched candidate details
-- Email applicants with recruiter contact and proposed time slots
-- Move processed files to `resume_processed`
+Notes:
+- This starts the LangGraph HTTP server. The Flask app calls `POST {LANGGRAPH_API_URL}/runs` with `assistant_id: recruit-agent`.
+- Make sure `LANGGRAPH_API_URL` in `.env` points to this server (e.g., `http://127.0.0.1:8123`).
 
-## How It Works
+### Run the Flask App
+In a new terminal:
+```bash
+source venv/bin/activate
+python Langgraph_server/app/app.py
+```
+On startup the app logs your config and can attempt to initialize a Google Drive webhook automatically when the required environment variables are present.
 
-1. **Resume Processing**: Extracts text and applicant information from PDF files using PyMuPDF
-2. **Experience Extraction**: Identifies and extracts the work experience section
-3. **Google Drive Reading**: Downloads and processes all job opportunities from Google Drive
-4. **Recruiter Info Extraction**: Finds recruiter emails and names in job descriptions
-5. **Matching**: Compares candidate experience with job requirements using OpenAI GPT-4
-6. **Acceptance Criteria**: Accepts if requirements are met or score ≥ 8/10
-7. **Calendar Check**: Finds morning and afternoon availability via Google Calendar Free/Busy
-8. **Email Sending (Recruiters)**: Sends personalized notifications to recruiters with applicant details
-9. **Email Sending (Applicants)**: Notifies applicants with recruiter contact and proposed time slots
+Visit:
+- http://localhost:8000/ to open the UI
+- http://localhost:8000/test-trigger?file_id=YOUR_FILE_ID&file_name=YOUR_FILE_NAME.pdf to manually trigger the agent for an existing file
 
-## API Keys and Security
+### Expose Your Local Server (Webhooks)
+For local testing, this project uses ngrok to expose the Flask server so Google can reach your webhook endpoint.
+```bash
+ngrok http 8000
+```
+Copy the public URL and set it as `LANGGRAPH_WEBHOOK_URL` in your `.env`.
 
-### Required API Keys
+Production note:
+- Hosting the Flask app on a publicly reachable domain and configuring a proper HTTPS webhook endpoint works fine. In that case, set `LANGGRAPH_WEBHOOK_URL` to your hosted URL (for example, `https://your-domain.com/webhooks/google-drive`) and ensure Google can reach it.
 
-1. **OpenAI API Key**
-   - Get from: https://platform.openai.com/api-keys
-   - Add to `.env` file as `OPENAI_API_KEY=your_key_here`
-   - Used for resume matching and experience extraction
+### Configure the Google Drive Webhook
+The app provides an endpoint and helper flow to register a webhook that listens for file changes and then triggers the agent when new PDFs land in your input folder.
 
-2. **Gentoro MCP Server Key**
-   - Provided by Gentoro
-   - Add to `.env` file as `gentoro_mcp_url=your_key_here`
-   - To get url: 
-   1. Create a tool box and add desired integrations
-   2. After creating and confirming, click "Use toolbox" in the upper right corner
-   3. Select "Signed HTTP Streamable MCP URL" and paste that into your .env file
+- Endpoint that Google will call: `/webhooks/google-drive`
+- Automatic setup attempt is performed at app startup when `LANGGRAPH_WEBHOOK_URL` and `INPUT_FOLDER_ID` are set
+- You can also check status at:
+  - http://localhost:8000/check-webhook-status
 
-### Security Notes
+Webhook behavior:
+- When Google Drive notifies about a change, the app fetches changes since the last token, filters for files in `INPUT_FOLDER_ID` that end with `.pdf`, and spawns a background thread to call the LangGraph API.
+- A cooldown-based dedup prevents triggering the agent multiple times for the same file in quick succession.
 
-- Never commit API keys to version control
-- Use `.env` file for sensitive configuration
-- Keep Google OAuth credentials secure
-- The `.env` file is already in `.gitignore`
+### How Processing is Triggered
+- The app posts to `{LANGGRAPH_API_URL}/runs` with payload:
+  - `assistant_id: "recruit-agent"`
+  - `input` contains: `file_id`, `file_name`, `input_folder_id`, `resume_folder_id`, `output_folder_id` and additional fields used by the agent
+- The agent defined in `Langgraph_server/src/agent/recruit_agent.py`:
+  - Downloads and parses the resume
+  - Extracts applicant info
+  - Reads job descriptions
+  - Matches resume to jobs
+  - Sends recruiter and applicant emails via MCP tools
 
-## Troubleshooting
+### Required Environment Variables (recap)
+- `LANGGRAPH_WEBHOOK_URL`: Public HTTPS URL to your Flask app `/webhooks/google-drive`
+- `LANGGRAPH_API_URL`: Base URL of your running LangGraph HTTP server
+- `INPUT_FOLDER_ID`: Google Drive folder ID to watch for resumes
+- `OUTPUT_FOLDER_ID`: Google Drive folder ID where processed files can go
+- `RESUME_FOLDER_ID`: Google Drive folder ID containing job descriptions/opportunities
 
-### Common Issues and Solutions
+Environment file placement:
+- Place your `.env` file in your langgraph project directory (but not with the agent). If you are given an `example.env`, put it in the same location and rename to `.env`.
 
-#### 1. "Session terminated" Errors
-- **Cause**: Usually indicates a misspelled tool name in MCP calls
-- **Solution**: Check tool names in the code, especially in `recruit_agent.py`
-- **Example**: `googlemail_send_email` vs `googleemail_send_email` (typo)
+### Project Structure (key paths)
+```
+/Users/Zahir/Desktop/Gentoro Agent Work/Recruitment Assistant Agent/
+  requirements.txt
 
-#### 2. "Key null" Errors
-- **Cause**: API not authenticated on Gentoro's server side
-- **Solution**: Contact Gentoro support to configure the API on their end
-- **Note**: This is not a local configuration issue
+  Langgraph_server/
+    app/
+      app.py
+    google_oauth/
+      client_secret.json
+      token.json
+      credentials.json
+    langgraph.json
+    src/
+      agent/
+        recruit_agent.py
+```
 
-#### 3. Google Drive Authentication Issues
-- **Cause**: OAuth2 credentials not properly set up
-- **Solution**: 
-  - Ensure `client_secret_*.json` is in `google_project_json/`
-  - Run the agent and follow the authentication prompts
-  - Check that the Drive API is enabled in Google Cloud Console
+### Common Tips
+- Ensure the service account and OAuth client have access to the target Drive folders and any calendars you query.
+- Verify `assistant_id` in `langgraph.json` matches the value used by the Flask app (`recruit-agent`).
+- If the webhook doesn’t initialize automatically, ensure your public URL is reachable and `.env` values are correct. You can recreate the channel daily since Google webhooks expire.
 
-#### 4. OpenAI API Errors
-- **Cause**: Invalid API key or insufficient credits
-- **Solution**: 
-  - Verify your API key in the `.env` file
-  - Check your OpenAI account has sufficient credits
-  - Ensure the API key is properly formatted
+### Development Commands
+```bash
+# Start LangGraph server
+langgraph dev
 
-#### 5. File Processing Errors
-- **Cause**: Corrupted PDF files or unsupported formats
-- **Solution**: 
-  - Ensure files are valid PDFs
-  - Check file permissions
-  - Verify the resume folders exist
+# Run Flask app
+python Langgraph_server/app/app.py
 
-### Debug Mode
+# Expose 8000 for webhooks
+ngrok http 8000
+```
 
-To enable debug output, add print statements or modify the logging level in the code. The agent includes extensive logging to help diagnose issues.
+### Status and Cloud Support
+- This repository is still in development; expect changes and potential issues.
+- It has not been tested on LangGraph Cloud yet. The documented flow targets local development using `langgraph dev`.
 
-## Dependencies
+### Troubleshooting
+- "Session terminated" errors: Often a tool name typo in MCP calls. Verify tool names.
+- "Key null" errors: API not authenticated on Gentoro’s server. Configure server-side API.
+- Google Drive auth issues: Ensure OAuth credentials exist and Drive API enabled; re-run auth.
+- OpenAI API errors: Check key, credits, and formatting in `.env`.
+- File processing errors: Ensure valid PDFs and that folders exist.
 
-Key dependencies from `requirements.txt`:
+### Dependencies (from requirements.txt)
+- langgraph, langchain_core, openai
+- google-auth-oauthlib, google-auth-httplib2, google-api-python-client
+- pymupdf, python-docx
+- fastmcp, tavily-python
+- python-dotenv, pydantic, requests
+- fastapi, fastui (optional UI)
+- watchdog (monitoring)
 
-### Core Framework
-- `langgraph==0.5.4`: Graph-based agent orchestration
-- `langchain_core==0.3.72`: Core LangChain utilities
-- `openai==1.86.0`: OpenAI API integration
+### Known Issues and Limitations
+1. Early development; ongoing changes.
+2. Some error handling may be incomplete.
+3. MCP tool names can change and require updates.
+4. First-time OAuth may require manual approval.
+5. PDF-only for resumes at the moment.
+6. Calendar integration may evolve.
 
-### Google Services
-- `google-auth-oauthlib==1.2.0`: OAuth2 authentication
-- `google-auth-httplib2==0.2.0`: HTTP client for Google APIs
-- `google-api-python-client==2.116.0`: Google Drive and Calendar APIs
-
-### File Processing
-- `pymupdf==1.26.4`: PDF text extraction (PyMuPDF)
-- `python-docx==1.2.0`: DOCX text extraction
-
-### MCP and External Services
-- `fastmcp==2.10.6`: MCP client for external services
-- `tavily-python==0.7.10`: Web search capabilities
-
-### Utilities
-- `python-dotenv==1.1.1`: Environment variable management
-- `pydantic==2.11.7`: Data validation
-- `requests==2.32.4`: HTTP requests
-
-### Web Framework (for potential UI)
-- `fastapi==0.116.1`: Web framework
-- `fastui==0.7.0`: UI components
-
-### Monitoring
-- `watchdog==6.0.0`: File system monitoring
-
-## Known Issues and Limitations
-
-1. **Early Development**: This project is in early stages with ongoing development
-2. **Error Handling**: Some error handling may be incomplete
-3. **Tool Name Dependencies**: MCP tool names may change and require updates
-4. **Authentication**: OAuth2 flow may need manual intervention on first run
-5. **File Formats**: Currently only supports PDF files for resumes
-6. **Calendar Integration**: Google Calendar integration is in progress
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
-## License
-
-[Add your license information here]
-
-## Support
-
-For issues and questions:
-- Check the troubleshooting section above
-- Review the code comments for implementation details
-- Contact the development team
-
-## Roadmap
-
-Future improvements planned:
-- [ ] Better error handling and recovery
-- [ ] Support for more file formats (DOCX, TXT)
-- [ ] Web interface for easier configuration
-- [ ] Improved applicant information extraction
-- [ ] Better calendar integration
-- [ ] Resume scoring and ranking
-- [ ] Integration with ATS systems
-
----
-
-**Note**: This agent is designed for automated recruitment workflows. Ensure compliance with local data protection and privacy regulations when processing candidate information. The project is in early development - use with caution and expect ongoing changes.
 
