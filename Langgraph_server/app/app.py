@@ -24,7 +24,7 @@ RESUME_FOLDER_ID = os.getenv("RESUME_FOLDER_ID") # Folder with resumes
 SERVICE_ACCOUNT_FILE = os.path.join("Langgraph_server", "google_oauth", "credentials.json")
 script_dir = os.path.dirname(os.path.abspath(__file__))
 SERVICE_ACCOUNT_FILE = os.path.abspath(os.path.join(script_dir, '..', 'google_oauth', 'credentials.json'))
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/gmail.send"]
 # This is the URL that Google Drive sends notifications to (i.e., this app's endpoint)
 webhook_url = os.getenv("LANGGRAPH_WEBHOOK_URL")
 # This is the URL of the LangGraph API server
@@ -64,9 +64,13 @@ def get_drive_service():
                     prompt="consent"
                 )  # opens browser for login, make sure https://localhost/'port' is added to oauth redirect uri.
             print("OAuth Accepted!")
-            # Save token for next run
-            with open(TOKEN_PATH, "w") as token:
-                token.write(creds.to_json())
+            try:
+                # Save token for next run
+                with open(TOKEN_PATH, "w") as token:
+                    token.write(creds.to_json())
+            except Exception as e:
+                print(f"❌ Error saving token: {e}")
+                raise
 
         return build("drive", "v3", credentials=creds)
     except Exception as e:
