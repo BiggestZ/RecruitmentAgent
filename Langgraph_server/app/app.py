@@ -154,6 +154,7 @@ def trigger_langgraph_processing(file_id: str, file_name: str):
             "experience_text": None, # Generated in recruit_agent.py - parsepdf
             "applicant_name": None, # Generated in recruit_agent.py - parsepdf
             "applicant_email": "", # Generated in recruit_agent.py - parsepdf"
+            "resume_readable": True, # Default to True, will be set to False if work experience not found
             
             "input_folder_id": FOLDER_ID,
             "resume_folder_id": RESUME_FOLDER_ID,
@@ -532,7 +533,7 @@ def webhook():
                 includeRemoved=False,  # Only new/modified files
                 fields="changes(file(id,name,parents,mimeType)),newStartPageToken"
             ).execute()
-            # print("Changes.response occurs")
+            print("Changes.response occurs")
 
             changes = changes_response.get('changes', [])
             for change in changes:

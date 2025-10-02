@@ -12,7 +12,7 @@ from typing import TypedDict, Optional, List, Union, Literal, Annotated
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, HttpError
 from google.oauth2 import service_account
 from email.mime.text import MIMEText
 import fitz  # PyMuPDF
@@ -65,6 +65,7 @@ class AgentState(TypedDict):
     experience_text: Optional[str] # Extracted experience section from the resume
     applicant_name: Optional[str] # Name of the applicant
     applicant_email: str # Email of the applicant
+    resume_readable: bool # Flag to track if resume could be processed successfully
 
     # Google Drive fields
     input_folder_id: str # The ID of the Google Drive folder with the opportunities
@@ -127,12 +128,16 @@ def parse_pdf_node(state: AgentState) -> AgentState:
             'applicant_name': applicant_name,
             'applicant_email': applicant_email or ""
         }
+    except ssl.SSLError as e:
+        print(f"❌ SSL Error while downloading {file_name}: {e}")
+        return {"raw_text": "", "applicant_name": None, "applicant_email": ""}
+
+    except HttpError as e:
+        print(f"❌ Google API Error while accessing {file_name}: {e}")
+        return {"raw_text": "", "applicant_name": None, "applicant_email": ""}
+
     except Exception as e:
-        print(f"Error extracting text from PDF: {e}")
-        # os.remove(r_fp) # delete the unusable resume
-        # Add line to remove a broken or push for manual review 
-        raise RuntimeError("Failed to parse PDF due to SSL error")
-        #sys.exit(0)
+        print(f"❌ Unexpected error while processing {file_name}: {e}")
         return {"raw_text": "", "applicant_name": None, "applicant_email": ""}
 
 # Extracts the experience section from the resume text
@@ -150,8 +155,8 @@ def extract_experience_node(state: AgentState) -> AgentState:
     try:
         start_index = next(i for i, line in enumerate(lines) if start_key in line.upper())
     except StopIteration:
-        print("⚠️ 'WORK EXPERIENCE' section not found.")
-        return {"experience_text": ""}
+        print("❌ 'WORK EXPERIENCE' section not found. Resume could not be read.")
+        return {"experience_text": "", "resume_readable": False}
 
     # Look for the next heading after WORK EXPERIENCE
     end_index = len(lines)
@@ -162,7 +167,14 @@ def extract_experience_node(state: AgentState) -> AgentState:
 
     # Extract and return just the experience section
     experience_lines = lines[start_index:end_index]
-    return {'experience_text':"\n".join(experience_lines)} 
+    return {'experience_text':"\n".join(experience_lines), "resume_readable": True} 
+
+def resume_unreadable_end_node(state: AgentState) -> AgentState:
+    """Handles the case when resume could not be read due to missing work experience section."""
+    print(f"🛑 Processing terminated: Resume '{state['file_name']}' could not be read.")
+    print("   Reason: 'WORK EXPERIENCE' section not found in the resume.")
+    print("   The recruitment process has been stopped for this file.")
+    return state
 
 # Cleans up text to make information extraction easier.
 def clean_job_text(text: str) -> str:
@@ -871,12 +883,20 @@ This is an automated message. Please reply with your preferred meeting time or c
 
         return state
 
+def should_continue_processing(state: AgentState) -> str:
+    """Determines whether to continue processing or end due to unreadable resume."""
+    if not state.get("resume_readable", True):
+        return "resume_unreadable_end"
+    else:
+        return "read_drive_folder"
+
 # Build LangGraph
 builder = StateGraph(AgentState)
 
 # Nodes
 builder.add_node("parse_pdf", parse_pdf_node)
 builder.add_node("extract_experience", extract_experience_node)
+builder.add_node("resume_unreadable_end", resume_unreadable_end_node)
 builder.add_node("read_drive_folder", read_drive_folder_node)
 builder.add_node("extract_recruiters_emails_node", extract_recruiter_emails_node)
 builder.add_node("match_resume_node", match_resume_node)
@@ -886,12 +906,20 @@ builder.add_node("send_app_email_node", send_applicant_emails_node)
 # Edges
 builder.add_edge(START, "parse_pdf")
 builder.add_edge("parse_pdf", "extract_experience")
-builder.add_edge("extract_experience", "read_drive_folder")
+builder.add_conditional_edges(
+    "extract_experience",
+    should_continue_processing,
+    {
+        "resume_unreadable_end": "resume_unreadable_end",
+        "read_drive_folder": "read_drive_folder"
+    }
+)
 builder.add_edge("read_drive_folder", "extract_recruiters_emails_node")
 builder.add_edge("extract_recruiters_emails_node", "match_resume_node")
 builder.add_edge("match_resume_node", "send_recruiter_emails_node")
 builder.add_edge("send_recruiter_emails_node", "send_app_email_node")
 builder.add_edge("send_app_email_node", END)
+builder.add_edge("resume_unreadable_end", END)
 
 
 # Compile the graph for the Langgraph API
